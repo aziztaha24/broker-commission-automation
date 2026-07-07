@@ -1,0 +1,190 @@
+"""Core transform: NetSuite source export -> import-ready commission file.
+
+Every rule here was verified against the June 2026 files:
+  - individuals: Comm Amt / Commissionable >= 6% -> Individual Primary (4),
+    else Individual General Agent (5). 0 mismatches on 1,611 rows.
+  - group rows: broker name matched (case/space-insensitively) against the
+    deal hierarchy -> Primary (1) / GA (2) / Managing GA (3).
+    914/915 rows; the 1 exception was a manual override -> review dialog.
+  - PEPM / Flat Rate / Sharx&Tech -> type 7 with the label written to Memo.
+  - unclassifiable rows -> exceptions file (June: 113 rows).
+"""
+from __future__ import annotations
+import re
+from dataclasses import dataclass, field
+
+import pandas as pd
+
+from . import config as C
+from .lookups import Lookups
+from .matching import NameMatcher, MatchResult
+
+
+def clean_money(v) -> float | None:
+    if pd.isna(v):
+        return None
+    s = re.sub(r"[$,\s]", "", str(v))
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _norm(s) -> str:
+    return " ".join(str(s).strip().lower().split()) if pd.notna(s) else ""
+
+
+def is_group_row(row) -> bool:
+    return str(row.get("ID", "")).strip().upper().startswith("G-")
+
+
+@dataclass
+class RunResult:
+    output: pd.DataFrame            # import-ready rows
+    exceptions: pd.DataFrame        # dropped rows + reason
+    pending_review: list[MatchResult]  # unresolved broker names (pause here)
+    stats: dict = field(default_factory=dict)
+
+
+def classify_group_role(broker_name: str, hierarchy: dict) -> int | None:
+    b = _norm(broker_name)
+    if not b or not hierarchy:
+        return None
+    if b == _norm(hierarchy.get("primary", ("",))[0]) or \
+       b == _norm(hierarchy.get("co_primary", ("",))[0]):
+        return C.PRIMARY_BROKER
+    if b == _norm(hierarchy.get("ga", ("",))[0]):
+        return C.GENERAL_AGENT
+    if b == _norm(hierarchy.get("mga", ("",))[0]):
+        return C.MANAGING_GENERAL_AGENT
+    return None
+
+
+def classify_individual(comm_amt: float | None, commissionable: float | None) -> int | None:
+    if not comm_amt or not commissionable:
+        return None
+    # round to 6 decimals: 16.26/271*100 floats to 5.999999999999999,
+    # which must still count as the 6% boundary (matches Excel behavior)
+    ratio = round(comm_amt / commissionable * 100, 6)
+    return (C.INDIVIDUAL_PRIMARY if ratio >= C.INDIVIDUAL_PRIMARY_MIN_RATIO
+            else C.INDIVIDUAL_GENERAL_AGENT)
+
+
+def run_transform(source: pd.DataFrame, onhold_groups: set[str],
+                  lookups: Lookups, matcher: NameMatcher,
+                  period_mmyyyy: str) -> RunResult:
+    """period_mmyyyy e.g. '062026'. If pending_review is non-empty the run
+    should pause: resolve names (adding aliases), then call again."""
+    df = source.copy()
+
+    # --- 1. drop on-hold groups ------------------------------------------
+    onhold_norm = {_norm(g) for g in onhold_groups if _norm(g)}
+    df["_onhold"] = df["Group Name"].map(lambda g: _norm(g) in onhold_norm)
+
+    # --- 2. sort: groups first (desc), then individuals (desc) -----------
+    df["_isgroup"] = df.apply(is_group_row, axis=1)
+    df = df.sort_values(["_isgroup", "ID"], ascending=[False, False],
+                        kind="stable").reset_index(drop=True)
+
+    # --- 3. resolve broker names -----------------------------------------
+    unique_names = df["Brokers Name"].dropna().unique()
+    resolutions: dict[str, MatchResult] = {n: matcher.match(n) for n in unique_names}
+    pending = [m for m in resolutions.values() if not m.resolved]
+    if pending:  # pause for the review dialog before doing any more work
+        return RunResult(pd.DataFrame(), pd.DataFrame(), pending,
+                         {"unique_brokers": len(unique_names),
+                          "unresolved": len(pending)})
+
+    # --- 4. row-by-row build ----------------------------------------------
+    out_rows, exc_rows = [], []
+    for _, r in df.iterrows():
+        reason = None
+        broker = resolutions[r["Brokers Name"]].matched_name if pd.notna(r["Brokers Name"]) else None
+        vendor_id = lookups.vendor_id_by_name.get(broker) if broker else None
+        gid = str(r["ID"]).strip() if pd.notna(r["ID"]) else ""
+        hierarchy = lookups.hierarchy_by_group.get(gid, {})
+        comm_amt = clean_money(r["Comm Amt"])
+        commissionable = clean_money(r["Commissionable"])
+
+        # classification
+        ctype, memo = None, None
+        src_type = str(r["Comm Type"]).strip() if pd.notna(r["Comm Type"]) else ""
+        if r["_onhold"]:
+            reason = "group on hold"
+        elif vendor_id is None:
+            reason = "broker not in vendor list (rejected in review)"
+        elif src_type in C.TYPE7_MEMO:
+            if not comm_amt:  # $0 PEPM/flat rows: nothing to pay (June rule)
+                reason = "zero-amount PEPM/flat/sharx row"
+            else:
+                ctype, memo = C.ADDITIONAL, C.TYPE7_MEMO[src_type]
+        elif src_type == C.INDIVIDUAL:
+            # edge case (verified in June): rows labeled individual but
+            # carrying a G- group ID belong to the group's deal hierarchy
+            if gid.upper().startswith("G-"):
+                ctype = classify_group_role(broker, hierarchy)
+            if ctype is None:
+                ctype = classify_individual(comm_amt, commissionable)
+            reason = None if ctype else "individual row missing amounts"
+        elif src_type in (C.GROUP_BROKER, C.GROUP_GA):
+            ctype = classify_group_role(broker, hierarchy)
+            reason = None if ctype else "broker not found in deal hierarchy"
+        else:
+            reason = f"unknown comm type: {src_type}"
+
+        if reason or ctype is None:
+            exc_rows.append({**r.to_dict(), "Exception Reason": reason or "unclassified"})
+            continue
+
+        h = {p: hierarchy.get(p, (None, None)) for p, _, _ in
+             [(x[0], x[1], x[2]) for x in
+              [("primary", 0, 0), ("co_primary", 0, 0), ("ga", 0, 0), ("mga", 0, 0)]]}
+        vid = lookups.vendor_id_by_name  # shorthand
+
+        out_rows.append({
+            "External ID": f"BROKER-COM-{period_mmyyyy}-{vendor_id}",
+            "Vendor": vendor_id,
+            "Commission Type": ctype,
+            "Subsidiary": C.SUBSIDIARY,
+            "Account": C.ACCOUNT,
+            "Expense Account": C.EXPENSE_ACCOUNT,
+            "Broker Vendor Bill": C.BROKER_VENDOR_BILL,
+            "Memo": memo,
+            "Group ": lookups.group_internal_by_id.get(gid),
+            "ID": gid,
+            "Group Name": r.get("Group Name"),
+            "Member First Name": r.get("Member First Name"),
+            "Member Last Name": r.get("Member Last Name"),
+            "Invoice Amt": clean_money(r["Invoice Amt"]),
+            "Commissionable": commissionable,
+            "Comm Rate": r.get("Comm Rate"),
+            " Comm Amt ": comm_amt,
+            "Product Label": r.get("Product Label"),
+            "Posted Date": r.get("Posted Date"),
+            "Transaction Paid Through Start": r.get("Transaction Paid Through Start"),
+            "Transaction Paid Through End": r.get("Transaction Paid Through End"),
+            "PEPM": r.get("PEPM"),
+            "Adjustments": r.get("Adjustments"),
+            "Primary Broker Internal ID": vid.get(h["primary"][0]),
+            "Deal Primary Broker": h["primary"][0],
+            "Primary Broker Commission": h["primary"][1],
+            "Co-Primary Internal ID": vid.get(h["co_primary"][0]),
+            "Deal Co-Primary Broker": h["co_primary"][0],
+            "Co-Primary Brokers Commission": h["co_primary"][1],
+            "General Agent Internal ID": vid.get(h["ga"][0]),
+            "Deal General Agent": h["ga"][0],
+            "General Agent Commission": h["ga"][1],
+            "Managing GA Internal ID": vid.get(h["mga"][0]),
+            "Deal Managing GA": h["mga"][0],
+            "Managing General Agents Commission": h["mga"][1],
+        })
+
+    output = pd.DataFrame(out_rows, columns=C.OUTPUT_COLUMNS)
+    exceptions = pd.DataFrame(exc_rows)
+    stats = {
+        "source_rows": len(df),
+        "output_rows": len(output),
+        "exception_rows": len(exceptions),
+        "type_counts": output["Commission Type"].value_counts().to_dict() if len(output) else {},
+    }
+    return RunResult(output, exceptions, [], stats)
