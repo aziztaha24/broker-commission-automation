@@ -103,7 +103,15 @@ def review_dialog(pending, matcher):
 
 # --------------------------------------------------------------------- run
 def execute_run():
-    lk = get_lookups()
+    from engine.lookups import LookupSchemaError
+    try:
+        lk = get_lookups()
+    except LookupSchemaError as e:
+        st.error(f"Lookup file problem — {e}")
+        return
+    except Exception as e:
+        st.error(f"Couldn't read a lookup file: {e}")
+        return
     if lk is None:
         st.error("Provide the three lookup files (or tick the bundled option).")
         return
