@@ -260,10 +260,17 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
             out_rows.append(row)
 
     output = pd.DataFrame(out_rows, columns=C.OUTPUT_COLUMNS)
-    for col in ("Invoice Amt", "Commissionable", " Comm Amt "):
-        output[col] = pd.to_numeric(output[col], errors="coerce")
+    for col in ("Invoice Amt", "Commissionable", " Comm Amt ", "PEPM"):
+        output[col] = pd.to_numeric(output[col], errors="coerce").round(2)
     exceptions = pd.DataFrame(exc_rows)
-    src_total = round(sum(v for v in (clean_money(x) for x in df["Comm Amt"]) if v), 2)
+    if len(exceptions):
+        for col in ("Invoice Amt", "Commissionable", " Comm Amt ", "PEPM"):
+            if col in exceptions.columns:
+                exceptions[col] = pd.to_numeric(exceptions[col],
+                                                errors="coerce").round(2)
+    # identical rounding basis to the output columns (pandas half-even)
+    src_total = round(float(pd.Series([clean_money(x) for x in df["Comm Amt"]],
+                                      dtype="float64").round(2).sum()), 2)
     out_total = round(output[" Comm Amt "].sum(), 2) if len(output) else 0.0
     exc_total = (round(pd.to_numeric(exceptions[" Comm Amt "],
                   errors="coerce").fillna(0).sum(), 2) if len(exc_rows) else 0.0)
