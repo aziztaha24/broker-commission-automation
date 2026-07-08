@@ -151,6 +151,15 @@ if ss.pop("resume", False) and src_file is not None:
 res = ss.get("result")
 if res is not None and not res.pending_review:
     s = res.stats
+    exc_reasons = (res.exceptions["Exception Reason"].value_counts().to_dict()
+                   if len(res.exceptions) else {})
+    n_hier_miss = exc_reasons.get("broker not found in deal hierarchy", 0)
+    if s["output_rows"] and n_hier_miss > s["output_rows"] * 0.10:
+        st.warning(f"{n_hier_miss} rows couldn't find their group's deal "
+                   "hierarchy — the opportunities file may not be joining "
+                   "on the right Group ID. Check that its Group # values "
+                   "correspond to the source file's G-RDA IDs (directly or "
+                   "via the customers file).")
     a, b, c, d = st.columns(4)
     a.metric("Source rows", s["source_rows"])
     b.metric("Import rows", s["output_rows"])

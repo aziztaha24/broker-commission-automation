@@ -43,8 +43,8 @@ VENDOR_NAME_SYNS = ["name", "vendor name", "vendor", "company name",
                     "broker name", "entity", "entity id", "legal name"]
 VENDOR_ID_SYNS = ["internal_id", "internal id", "id", "vendor internal id"]
 
-GROUP_ID_SYNS = ["group_id", "group id", "id", "group", "customer id",
-                 "company id", "opportunity group id"]
+GROUP_ID_SYNS = ["group_id", "group id", "group #", "group number", "id",
+                 "group", "customer id", "company id", "opportunity group id"]
 INTERNAL_GROUP_SYNS = ["internal_group", "internal id", "internal group",
                        "internal group id", "group internal id", "customer internal id"]
 
@@ -102,6 +102,24 @@ def load_lookups(vendors_csv, opportunities_csv, customers_csv) -> Lookups:
             except (ValueError, TypeError):
                 continue
 
+    c = pd.read_csv(customers_csv)
+    ggcol = _find_col(c, GROUP_ID_SYNS, "Customers file", "group id")
+    igcol = _find_col(c, INTERNAL_GROUP_SYNS, "Customers file", "internal group number")
+    for _, r in c.iterrows():
+        if pd.notna(r[ggcol]) and pd.notna(r[igcol]):
+            lk.group_internal_by_id[str(r[ggcol]).strip()] = r[igcol]
+
+    def _numkey(v) -> str:
+        """normalize 31587 / 31587.0 / '31587' to '31587'"""
+        try:
+            return str(int(float(str(v).strip())))
+        except (ValueError, TypeError):
+            return str(v).strip()
+
+    # reverse map: internal group number -> G-RDA id (used if the
+    # opportunities export references groups by internal number)
+    rda_by_internal = {_numkey(v): k for k, v in lk.group_internal_by_id.items()}
+
     o = pd.read_csv(opportunities_csv)
     gcol = _find_col(o, GROUP_ID_SYNS, "Opportunities file", "group id")
     cols = {k: _find_col(o, syns, "Opportunities file", k, required=("name" in k))
@@ -110,6 +128,8 @@ def load_lookups(vendors_csv, opportunities_csv, customers_csv) -> Lookups:
         gid = str(r[gcol]).strip()
         if not gid or gid.lower() == "nan":
             continue
+        if not gid.upper().startswith("G-"):
+            gid = rda_by_internal.get(_numkey(gid), gid)
         roles = {}
         for prefix, _, _ in HIERARCHY_ROLES:
             nc, rc = cols[f"{prefix}_name"], cols.get(f"{prefix}_rate")
@@ -119,12 +139,5 @@ def load_lookups(vendors_csv, opportunities_csv, customers_csv) -> Lookups:
                 roles[prefix] = (str(nm).strip(),
                                  str(rt).strip() if pd.notna(rt) else "")
         lk.hierarchy_by_group[gid] = roles
-
-    c = pd.read_csv(customers_csv)
-    ggcol = _find_col(c, GROUP_ID_SYNS, "Customers file", "group id")
-    igcol = _find_col(c, INTERNAL_GROUP_SYNS, "Customers file", "internal group number")
-    for _, r in c.iterrows():
-        if pd.notna(r[ggcol]) and pd.notna(r[igcol]):
-            lk.group_internal_by_id[str(r[ggcol]).strip()] = r[igcol]
 
     return lk
