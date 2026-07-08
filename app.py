@@ -40,6 +40,8 @@ ALIAS_PATH = "data/aliases.json"
 HISTORY_PATH = "data/run_history.jsonl"
 ss = st.session_state
 ss.setdefault("decisions", {})     # source_name -> canonical | "__REJECT__"
+ss.setdefault("h_rejects", set())  # (broker, group_id) rejected this session
+ss.setdefault("n_rejects", set())  # source names rejected this session
 ss.setdefault("result", None)
 
 st.title("Broker commission run")
@@ -53,6 +55,15 @@ with c2:
     st.caption("Data source: file upload now; NetSuite saved-search pull "
                "activates once OAuth credentials are configured in secrets.")
 
+ns_ready = all(k in st.secrets for k in
+                ("NS_ACCOUNT_ID", "NS_CLIENT_ID", "NS_CERT_ID", "NS_PRIVATE_KEY"))
+pull_ns = st.toggle("Pull lookups directly from NetSuite", value=False,
+                    disabled=not ns_ready,
+                    help=("Requires NetSuite OAuth secrets — see "
+                          "SETUP_NETSUITE.md" if not ns_ready else
+                          "Vendors, opportunities and customers are pulled "
+                          "live via SuiteQL; no lookup uploads needed."))
+
 src_file = st.file_uploader("NetSuite source export (.xlsx)", type=["xlsx"])
 lc1, lc2, lc3 = st.columns(3)
 vend_file = lc1.file_uploader("Vendors lookup (.csv)", type=["csv"])
@@ -64,6 +75,17 @@ use_bundled = st.checkbox("Use bundled June lookups (testing)", value=True,
 
 
 def get_lookups():
+    if pull_ns:
+        from engine.netsuite import NetSuiteClient, pull_lookup_frames
+        import io as _io
+        client = NetSuiteClient(st.secrets["NS_ACCOUNT_ID"],
+                                st.secrets["NS_CLIENT_ID"],
+                                st.secrets["NS_CERT_ID"],
+                                st.secrets["NS_PRIVATE_KEY"])
+        v, o, c = pull_lookup_frames(client)
+        def _buf(df):
+            b = _io.StringIO(); df.to_csv(b, index=False); b.seek(0); return b
+        return load_lookups(_buf(v), _buf(o), _buf(c))
     if vend_file and opp_file and cust_file:
         return load_lookups(vend_file, opp_file, cust_file)
     if use_bundled:
@@ -71,6 +93,40 @@ def get_lookups():
                             "data/lookups/opportunities.csv",
                             "data/lookups/customers.csv")
     return None
+
+
+# ------------------------------------------------- hierarchy review dialog
+@st.dialog("Brokers not in their group's deal hierarchy", width="large")
+def hierarchy_dialog(pending):
+    from engine.matching import OverrideStore
+    from engine import config as C
+    st.caption("These brokers have commission rows for a group whose deal "
+               "hierarchy doesn't list them. Assign a role (remembered for "
+               "future runs) or send their rows to the exceptions file.")
+    store = OverrideStore("data/overrides.json")
+    choices = {}
+    for p in pending:
+        st.divider()
+        st.markdown(f"**{p['broker']}** — {p['group_name']} ({p['group_id']})  \n"
+                    f"{p['rows']} row(s), total ${p['total']:,.2f}")
+        hier = ", ".join(f"{k}: {v}" for k, v in p["hierarchy"].items() if v) or "empty"
+        st.caption(f"Deal hierarchy on file — {hier}")
+        choices[(p['broker'], p['group_id'])] = st.radio(
+            "Assign as:", ["Primary Broker (1)", "General Agent (2)",
+                           "Managing General Agent (3)",
+                           "Send to exceptions file"],
+            key=f"h_{p['broker']}_{p['group_id']}", label_visibility="collapsed")
+    st.divider()
+    if st.button("Save decisions and continue run", type="primary"):
+        code_map = {"Primary Broker (1)": 1, "General Agent (2)": 2,
+                    "Managing General Agent (3)": 3}
+        for (broker, gid), choice in choices.items():
+            if choice in code_map:
+                store.add(broker, gid, code_map[choice])
+            else:
+                ss.h_rejects.add((broker, gid))
+        ss["resume"] = True
+        st.rerun()
 
 
 # ----------------------------------------------------------- review dialog
@@ -95,7 +151,9 @@ def review_dialog(pending, matcher):
     st.divider()
     if st.button("Save decisions and continue run", type="primary"):
         for src_name, canon in ss.decisions.items():
-            if canon != "__REJECT__":
+            if canon == "__REJECT__":
+                ss.n_rejects.add(src_name)
+            else:
                 store.add(src_name, canon)
         ss["resume"] = True
         st.rerun()
@@ -121,18 +179,32 @@ def execute_run():
     if "OnHold" in xls.sheet_names:
         onhold = set(xls.parse("OnHold")["Group Name"].dropna().astype(str))
 
+    from engine.matching import OverrideStore
+    overrides = OverrideStore("data/overrides.json")
     matcher = NameMatcher(lk.canonical_names, AliasStore(ALIAS_PATH))
-    res = run_transform(source, onhold, lk, matcher, period)
+    with st.spinner("Processing…"):
+        res = run_transform(source, onhold, lk, matcher, period,
+                            override_store=overrides,
+                            hierarchy_rejects=ss.h_rejects,
+                            name_rejects=ss.n_rejects)
 
     # rows for rejected brokers: force into exceptions by leaving them
     # unmatched (matcher won't resolve them; transform routes them out)
     if res.pending_review:
         unresolved = [m for m in res.pending_review
-                      if ss.decisions.get(m.source_name) != "__REJECT__"]
+                      if ss.decisions.get(m.source_name) != "__REJECT__"
+                      and m.source_name not in ss.n_rejects]
         if unresolved:
             review_dialog(unresolved, matcher)
             return
-        res = run_transform(source, onhold, lk, matcher, period)
+        with st.spinner("Processing…"):
+            res = run_transform(source, onhold, lk, matcher, period,
+                                override_store=overrides,
+                                hierarchy_rejects=ss.h_rejects,
+                                name_rejects=ss.n_rejects)
+    if res.pending_hierarchy:
+        hierarchy_dialog(res.pending_hierarchy)
+        return
     ss["result"] = res
 
     with open(HISTORY_PATH, "a") as f:

@@ -74,6 +74,9 @@ class RunResult:
     exceptions: pd.DataFrame        # dropped rows + reason
     pending_review: list[MatchResult]  # unresolved broker names (pause here)
     stats: dict = field(default_factory=dict)
+    # unresolved hierarchy mismatches (second pause point):
+    # [{broker, group_id, group_name, rows, total, hierarchy}]
+    pending_hierarchy: list = field(default_factory=list)
 
 
 def classify_group_role(broker_name: str, hierarchy: dict) -> int | None:
@@ -102,7 +105,9 @@ def classify_individual(comm_amt: float | None, commissionable: float | None) ->
 
 def run_transform(source: pd.DataFrame, onhold_groups: set[str],
                   lookups: Lookups, matcher: NameMatcher,
-                  period_mmyyyy: str) -> RunResult:
+                  period_mmyyyy: str, override_store=None,
+                  hierarchy_rejects: set | None = None,
+                  name_rejects: set | None = None) -> RunResult:
     """period_mmyyyy e.g. '062026'. If pending_review is non-empty the run
     should pause: resolve names (adding aliases), then call again."""
     df = source.copy()
@@ -117,13 +122,49 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
                         kind="stable").reset_index(drop=True)
 
     # --- 3. resolve broker names -----------------------------------------
+    name_rejects = name_rejects or set()
     unique_names = df["Brokers Name"].dropna().unique()
     resolutions: dict[str, MatchResult] = {n: matcher.match(n) for n in unique_names}
-    pending = [m for m in resolutions.values() if not m.resolved]
+    pending = [m for m in resolutions.values()
+               if not m.resolved and m.source_name not in name_rejects]
     if pending:  # pause for the review dialog before doing any more work
         return RunResult(pd.DataFrame(), pd.DataFrame(), pending,
                          {"unique_brokers": len(unique_names),
                           "unresolved": len(pending)})
+
+    # --- 3b. detect hierarchy mismatches (second pause point) -------------
+    hierarchy_rejects = hierarchy_rejects or set()
+    pending_h: dict[tuple, dict] = {}
+    for _, r in df.iterrows():
+        src_type = str(r["Comm Type"]).strip() if pd.notna(r["Comm Type"]) else ""
+        if src_type not in (C.GROUP_BROKER, C.GROUP_GA) or r["_onhold"]:
+            continue
+        broker = (resolutions[r["Brokers Name"]].matched_name
+                  if pd.notna(r["Brokers Name"]) else None)
+        gid = str(r["ID"]).strip() if pd.notna(r["ID"]) else ""
+        if not broker or lookups.vendor_id_by_name.get(broker) is None:
+            continue  # rejected/unknown names go to exceptions in the build
+        hierarchy = lookups.hierarchy_by_group.get(gid, {})
+        if classify_group_role(broker, hierarchy) is not None:
+            continue
+        if override_store is not None and override_store.get(broker, gid) is not None:
+            continue
+        if (broker, gid) in hierarchy_rejects:
+            continue
+        k = (broker, gid)
+        amt = clean_money(r["Comm Amt"]) or 0.0
+        if k not in pending_h:
+            pending_h[k] = {"broker": broker, "group_id": gid,
+                            "group_name": r.get("Group Name"),
+                            "rows": 0, "total": 0.0,
+                            "hierarchy": {p: hierarchy.get(p, ("", ""))[0]
+                                          for p in ("primary", "co_primary", "ga", "mga")}}
+        pending_h[k]["rows"] += 1
+        pending_h[k]["total"] = round(pending_h[k]["total"] + amt, 2)
+    if pending_h:
+        return RunResult(pd.DataFrame(), pd.DataFrame(), [],
+                         {"unresolved_hierarchy": len(pending_h)},
+                         pending_hierarchy=list(pending_h.values()))
 
     # --- 4. row-by-row build ----------------------------------------------
     out_rows, exc_rows = [], []
@@ -142,7 +183,9 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
         if r["_onhold"]:
             reason = "group on hold"
         elif vendor_id is None:
-            reason = "broker not in vendor list (rejected in review)"
+            reason = ("broker name rejected in review"
+                      if pd.notna(r["Brokers Name"]) and r["Brokers Name"] in name_rejects
+                      else "broker not matched to a vendor")
         elif src_type in C.TYPE7_MEMO:
             if not comm_amt:  # $0 PEPM/flat rows: nothing to pay (June rule)
                 reason = "zero-amount PEPM/flat/sharx row"
@@ -158,21 +201,20 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
             reason = None if ctype else "individual row missing amounts"
         elif src_type in (C.GROUP_BROKER, C.GROUP_GA):
             ctype = classify_group_role(broker, hierarchy)
+            if ctype is None and override_store is not None:
+                ctype = override_store.get(broker, gid)
             reason = None if ctype else "broker not found in deal hierarchy"
         else:
             reason = f"unknown comm type: {src_type}"
-
-        if reason or ctype is None:
-            exc_rows.append({**r.to_dict(), "Exception Reason": reason or "unclassified"})
-            continue
 
         h = {p: hierarchy.get(p, (None, None)) for p, _, _ in
              [(x[0], x[1], x[2]) for x in
               [("primary", 0, 0), ("co_primary", 0, 0), ("ga", 0, 0), ("mga", 0, 0)]]}
         vid = lookups.vendor_id_by_name  # shorthand
 
-        out_rows.append({
-            "External ID": f"BROKER-COM-{period_mmyyyy}-{vendor_id}",
+        row = {
+            "External ID": (f"BROKER-COM-{period_mmyyyy}-{vendor_id}"
+                            if vendor_id is not None else None),
             "Vendor": vendor_id,
             "Commission Type": ctype,
             "Subsidiary": C.SUBSIDIARY,
@@ -208,14 +250,23 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
             "Managing GA Internal ID": vid.get(h["mga"][0]),
             "Deal Managing GA": h["mga"][0],
             "Managing General Agents Commission": h["mga"][1],
-        })
+        }
+        if reason or ctype is None:
+            # exceptions ship in the SAME import-ready layout so the file
+            # can be fixed by hand and imported as a second upload
+            exc_rows.append({**row, "Source Broker Name": r.get("Brokers Name"),
+                             "Exception Reason": reason or "unclassified"})
+        else:
+            out_rows.append(row)
 
     output = pd.DataFrame(out_rows, columns=C.OUTPUT_COLUMNS)
+    for col in ("Invoice Amt", "Commissionable", " Comm Amt "):
+        output[col] = pd.to_numeric(output[col], errors="coerce")
     exceptions = pd.DataFrame(exc_rows)
     src_total = round(sum(v for v in (clean_money(x) for x in df["Comm Amt"]) if v), 2)
     out_total = round(output[" Comm Amt "].sum(), 2) if len(output) else 0.0
-    exc_total = round(sum(v for v in (clean_money(x) for x in
-                      (exceptions["Comm Amt"] if len(exc_rows) else [])) if v), 2)
+    exc_total = (round(pd.to_numeric(exceptions[" Comm Amt "],
+                  errors="coerce").fillna(0).sum(), 2) if len(exc_rows) else 0.0)
     stats = {
         "source_rows": len(df),
         "output_rows": len(output),

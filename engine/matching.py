@@ -88,3 +88,29 @@ class NameMatcher:
         hits = process.extract(_norm(source_name), self._norm_list,
                                scorer=fuzz.token_sort_ratio, limit=k)
         return [(self._canon_by_norm[h[0]], h[1]) for h in hits]
+
+
+class OverrideStore:
+    """Persistent hierarchy overrides: (broker, group id) -> commission
+    type code. Same pattern as AliasStore; accepted decisions from the
+    hierarchy review dialog are remembered across runs."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._data: dict[str, int] = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                self._data = json.load(f)
+
+    @staticmethod
+    def _key(broker: str, group_id: str) -> str:
+        return f"{_norm(broker)}|{str(group_id).strip().upper()}"
+
+    def get(self, broker: str, group_id: str) -> int | None:
+        return self._data.get(self._key(broker, group_id))
+
+    def add(self, broker: str, group_id: str, code: int):
+        self._data[self._key(broker, group_id)] = int(code)
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump(self._data, f, indent=2, sort_keys=True)
