@@ -11,6 +11,7 @@ Every rule here was verified against the June 2026 files:
 """
 from __future__ import annotations
 import re
+import datetime as dt
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -32,6 +33,35 @@ def clean_money(v) -> float | None:
 
 def _norm(s) -> str:
     return " ".join(str(s).strip().lower().split()) if pd.notna(s) else ""
+
+
+def format_comm_rate(src_rate, comm_amt, commissionable, is_type7: bool) -> str | None:
+    """Output rate as 'X.XX%'. Type-7 (PEPM/Flat/Sharx) rows stay blank.
+    Priority: numeric source rate -> percent in source text ('8% + Flat
+    Rate' -> 8.00%) -> derived from Comm Amt / Commissionable."""
+    if is_type7:
+        return None
+    if pd.notna(src_rate):
+        try:
+            return f"{float(src_rate) * 100:.2f}%"
+        except (ValueError, TypeError):
+            m = re.search(r"(\d+(?:\.\d+)?)\s*%", str(src_rate))
+            if m:
+                return f"{float(m.group(1)):.2f}%"
+    if comm_amt and commissionable:
+        return f"{round(comm_amt / commissionable * 100, 2):.2f}%"
+    return None
+
+
+def format_adjustments(v):
+    """Datetime adjustments -> 'M/D/YYYY H:MM' (e.g. 4/1/2026 0:00).
+    Text adjustments ('Mar - May 2026') pass through unchanged."""
+    if pd.isna(v):
+        return None
+    if isinstance(v, (pd.Timestamp, dt.datetime, dt.date)):
+        t = pd.Timestamp(v)
+        return f"{t.month}/{t.day}/{t.year} {t.hour}:{t.minute:02d}"
+    return v
 
 
 def is_group_row(row) -> bool:
@@ -157,14 +187,15 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
             "Member Last Name": r.get("Member Last Name"),
             "Invoice Amt": clean_money(r["Invoice Amt"]),
             "Commissionable": commissionable,
-            "Comm Rate": r.get("Comm Rate"),
+            "Comm Rate": format_comm_rate(r.get("Comm Rate"), comm_amt,
+                                          commissionable, ctype == C.ADDITIONAL),
             " Comm Amt ": comm_amt,
             "Product Label": r.get("Product Label"),
             "Posted Date": r.get("Posted Date"),
             "Transaction Paid Through Start": r.get("Transaction Paid Through Start"),
             "Transaction Paid Through End": r.get("Transaction Paid Through End"),
             "PEPM": r.get("PEPM"),
-            "Adjustments": r.get("Adjustments"),
+            "Adjustments": format_adjustments(r.get("Adjustments")),
             "Primary Broker Internal ID": vid.get(h["primary"][0]),
             "Deal Primary Broker": h["primary"][0],
             "Primary Broker Commission": h["primary"][1],
@@ -181,10 +212,18 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
 
     output = pd.DataFrame(out_rows, columns=C.OUTPUT_COLUMNS)
     exceptions = pd.DataFrame(exc_rows)
+    src_total = round(sum(v for v in (clean_money(x) for x in df["Comm Amt"]) if v), 2)
+    out_total = round(output[" Comm Amt "].sum(), 2) if len(output) else 0.0
+    exc_total = round(sum(v for v in (clean_money(x) for x in
+                      (exceptions["Comm Amt"] if len(exc_rows) else [])) if v), 2)
     stats = {
         "source_rows": len(df),
         "output_rows": len(output),
         "exception_rows": len(exceptions),
         "type_counts": output["Commission Type"].value_counts().to_dict() if len(output) else {},
+        "source_total": src_total,
+        "output_total": out_total,
+        "exceptions_total": exc_total,
+        "reconciliation_gap": round(src_total - out_total - exc_total, 2),
     }
     return RunResult(output, exceptions, [], stats)

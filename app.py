@@ -165,6 +165,20 @@ if res is not None and not res.pending_review:
     b.metric("Import rows", s["output_rows"])
     c.metric("Exceptions", s["exception_rows"])
     d.metric("Commission types", len(s["type_counts"]))
+
+    # ------------------------------------------------ money reconciliation
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Source total $", f"{s['source_total']:,.2f}")
+    r2.metric("Import file $", f"{s['output_total']:,.2f}")
+    r3.metric("Exceptions $", f"{s['exceptions_total']:,.2f}")
+    r4.metric("Gap", f"{s['reconciliation_gap']:,.2f}")
+    if abs(s["reconciliation_gap"]) < 0.01:
+        st.success("Reconciled — source total = import file + exceptions, "
+                   "to the cent. Every source dollar is accounted for.")
+    else:
+        st.error(f"RECONCILIATION GAP of {s['reconciliation_gap']:,.2f} — "
+                 "some source amounts are in neither output file. "
+                 "Do not import until this is resolved.")
     st.dataframe(res.output.head(50), use_container_width=True)
 
     buf = io.StringIO(); res.output.to_csv(buf, index=False)
