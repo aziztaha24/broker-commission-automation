@@ -39,8 +39,10 @@ def _find_col(df: pd.DataFrame, synonyms: list[str], file_label: str,
     return None
 
 
-VENDOR_NAME_SYNS = ["name", "vendor name", "vendor", "company name",
-                    "broker name", "entity", "entity id", "legal name"]
+# "company name" outranks "name": NetSuite's Name column is often
+# entity-ID-prefixed ("716 Joyful Insurance...") while Company Name is clean
+VENDOR_NAME_SYNS = ["company name", "vendor name", "name", "vendor",
+                    "broker name", "entity", "legal name"]
 VENDOR_ID_SYNS = ["internal_id", "internal id", "id", "vendor internal id"]
 
 GROUP_ID_SYNS = ["group_id", "group id", "group #", "group number", "id",
@@ -92,13 +94,20 @@ def load_lookups(vendors_csv, opportunities_csv, customers_csv) -> Lookups:
     """Args may be file paths or uploaded file objects (Streamlit)."""
     lk = Lookups()
 
+    import re as _re
     v = pd.read_csv(vendors_csv)
     ncol = _find_col(v, VENDOR_NAME_SYNS, "Vendors file", "vendor name")
     icol = _find_col(v, VENDOR_ID_SYNS, "Vendors file", "internal id")
+    altcol = next((c for c in v.columns if c != ncol and
+                   _canon(c) in ("name", "entity")), None)
     for _, r in v.iterrows():
-        if pd.notna(r[ncol]) and pd.notna(r[icol]):
+        nm = r[ncol]
+        if pd.isna(nm) and altcol is not None and pd.notna(r[altcol]):
+            # strip NetSuite's leading entity-id prefix: "716 Joyful..." -> "Joyful..."
+            nm = _re.sub(r"^\d+\s+", "", str(r[altcol]))
+        if pd.notna(nm) and str(nm).strip() and pd.notna(r[icol]):
             try:
-                lk.vendor_id_by_name[str(r[ncol]).strip()] = int(float(r[icol]))
+                lk.vendor_id_by_name[str(nm).strip()] = int(float(r[icol]))
             except (ValueError, TypeError):
                 continue
 
