@@ -109,8 +109,10 @@ class OverrideStore:
     def get(self, broker: str, group_id: str) -> int | None:
         return self._data.get(self._key(broker, group_id))
 
-    def add(self, broker: str, group_id: str, code: int):
-        self._data[self._key(broker, group_id)] = int(code)
+    def add(self, broker: str, group_id: str, decision):
+        """decision: {"pay_to": "primary"|"ga"|"mga"} or
+        {"pay_to": "self", "code": 1|2|3} (legacy plain ints also accepted)"""
+        self._data[self._key(broker, group_id)] = decision
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "w") as f:
             json.dump(self._data, f, indent=2, sort_keys=True)

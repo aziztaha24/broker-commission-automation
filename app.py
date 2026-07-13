@@ -70,6 +70,9 @@ vend_file = lc1.file_uploader("Vendors lookup (.csv)", type=["csv"])
 opp_file = lc2.file_uploader("Opportunities lookup (.csv)", type=["csv"])
 cust_file = lc3.file_uploader("Customers lookup (.csv)", type=["csv"])
 
+drop_negatives = st.checkbox(
+    "Move vendors with zero/negative totals to the exceptions file "
+    "(NetSuite cannot post these bills)", value=True)
 use_bundled = st.checkbox("Use bundled June lookups (testing)", value=True,
                           disabled=bool(vend_file and opp_file and cust_file))
 
@@ -99,32 +102,47 @@ def get_lookups():
 @st.dialog("Brokers not in their group's deal hierarchy", width="large")
 def hierarchy_dialog(pending):
     from engine.matching import OverrideStore
-    from engine import config as C
-    st.caption("These brokers have commission rows for a group whose deal "
-               "hierarchy doesn't list them. Assign a role (remembered for "
-               "future runs) or send their rows to the exceptions file.")
+    st.caption("The named broker isn't on this group's deal. Choose who "
+               "should actually be paid — your choice is remembered for "
+               "future runs.")
     store = OverrideStore("data/overrides.json")
     choices = {}
     for p in pending:
         st.divider()
-        st.markdown(f"**{p['broker']}** — {p['group_name']} ({p['group_id']})  \n"
-                    f"{p['rows']} row(s), total ${p['total']:,.2f}")
-        hier = ", ".join(f"{k}: {v}" for k, v in p["hierarchy"].items() if v) or "empty"
-        st.caption(f"Deal hierarchy on file — {hier}")
-        choices[(p['broker'], p['group_id'])] = st.radio(
-            "Assign as:", ["Primary Broker (1)", "General Agent (2)",
-                           "Managing General Agent (3)",
-                           "Send to exceptions file"],
-            key=f"h_{p['broker']}_{p['group_id']}", label_visibility="collapsed")
+        st.markdown(f"Row says **{p['broker']}** — {p['group_name']} "
+                    f"({p['group_id']}), {p['rows']} row(s), "
+                    f"${p['total']:,.2f}")
+        opts, meta = [], []
+        role_labels = {"primary": "Primary Broker", "ga": "General Agent",
+                       "mga": "Managing General Agent"}
+        for rkey, label in role_labels.items():
+            nm = p["hierarchy"].get(rkey)
+            if nm:
+                opts.append(f"Pay the deal's {label} — {nm}")
+                meta.append({"pay_to": rkey})
+        opts.append(f"Pay {p['broker']} themselves")
+        meta.append({"pay_to": "self"})
+        opts.append("Send to exceptions file")
+        meta.append(None)
+        idx = st.radio("Pay to:", range(len(opts)),
+                       format_func=lambda i, o=opts: o[i],
+                       key=f"h_{p['broker']}_{p['group_id']}",
+                       label_visibility="collapsed")
+        decision = meta[idx]
+        if decision and decision["pay_to"] == "self":
+            code = st.selectbox("Bill them as:",
+                                ["Primary Broker (1)", "General Agent (2)",
+                                 "Managing General Agent (3)"],
+                                key=f"hc_{p['broker']}_{p['group_id']}")
+            decision = {"pay_to": "self", "code": int(code[-2])}
+        choices[(p['broker'], p['group_id'])] = decision
     st.divider()
     if st.button("Save decisions and continue run", type="primary"):
-        code_map = {"Primary Broker (1)": 1, "General Agent (2)": 2,
-                    "Managing General Agent (3)": 3}
-        for (broker, gid), choice in choices.items():
-            if choice in code_map:
-                store.add(broker, gid, code_map[choice])
-            else:
+        for (broker, gid), decision in choices.items():
+            if decision is None:
                 ss.h_rejects.add((broker, gid))
+            else:
+                store.add(broker, gid, decision)
         ss["resume"] = True
         st.rerun()
 
@@ -135,21 +153,39 @@ def review_dialog(pending, matcher):
     st.caption("Accepted matches are remembered for future runs. "
                "Rejected brokers' rows go to the exceptions file.")
     store = AliasStore(ALIAS_PATH)
+    all_vendors = sorted(matcher._canon_by_norm.values())
     for m in pending:
         st.divider()
         st.markdown(f"**Source file says:** {m.source_name}")
         candidates = matcher.top_candidates(m.source_name, k=5)
         options = [f"{name}  ({score:.0f}% similar)" for name, score in candidates]
+        options.append("Search the full vendor list…")
         options.append("Reject — send rows to exceptions file")
         default = 0 if m.suggestion else len(options) - 1
         choice = st.radio("Match to:", options, index=default,
                           key=f"pick_{m.source_name}", label_visibility="collapsed")
         if choice.startswith("Reject"):
             ss.decisions[m.source_name] = "__REJECT__"
+        elif choice.startswith("Search the full"):
+            picked = st.selectbox(
+                f"Type to search all {len(all_vendors)} vendors:",
+                all_vendors, index=None,
+                placeholder="Start typing a broker name…",
+                key=f"full_{m.source_name}")
+            if picked:
+                ss.decisions[m.source_name] = picked
+            else:
+                ss.decisions.pop(m.source_name, None)  # nothing chosen yet
         else:
             ss.decisions[m.source_name] = candidates[options.index(choice)][0]
     st.divider()
-    if st.button("Save decisions and continue run", type="primary"):
+    undecided = [m.source_name for m in pending
+                 if m.source_name not in ss.decisions]
+    if undecided:
+        st.warning("Pick a vendor from the search box (or another option) "
+                   f"for: {', '.join(undecided)}")
+    if st.button("Save decisions and continue run", type="primary",
+                 disabled=bool(undecided)):
         for src_name, canon in ss.decisions.items():
             if canon == "__REJECT__":
                 ss.n_rejects.add(src_name)
@@ -186,7 +222,8 @@ def execute_run():
         res = run_transform(source, onhold, lk, matcher, period,
                             override_store=overrides,
                             hierarchy_rejects=ss.h_rejects,
-                            name_rejects=ss.n_rejects)
+                            name_rejects=ss.n_rejects,
+                            exclude_nonpositive_vendors=drop_negatives)
 
     # rows for rejected brokers: force into exceptions by leaving them
     # unmatched (matcher won't resolve them; transform routes them out)

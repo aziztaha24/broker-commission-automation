@@ -107,7 +107,8 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
                   lookups: Lookups, matcher: NameMatcher,
                   period_mmyyyy: str, override_store=None,
                   hierarchy_rejects: set | None = None,
-                  name_rejects: set | None = None) -> RunResult:
+                  name_rejects: set | None = None,
+                  exclude_nonpositive_vendors: bool = True) -> RunResult:
     """period_mmyyyy e.g. '062026'. If pending_review is non-empty the run
     should pause: resolve names (adding aliases), then call again."""
     df = source.copy()
@@ -202,8 +203,26 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
         elif src_type in (C.GROUP_BROKER, C.GROUP_GA):
             ctype = classify_group_role(broker, hierarchy)
             if ctype is None and override_store is not None:
-                ctype = override_store.get(broker, gid)
-            reason = None if ctype else "broker not found in deal hierarchy"
+                ov = override_store.get(broker, gid)
+                if isinstance(ov, dict):  # pay-to decision
+                    role_map = {"primary": (C.PRIMARY_BROKER, "primary"),
+                                "ga": (C.GENERAL_AGENT, "ga"),
+                                "mga": (C.MANAGING_GENERAL_AGENT, "mga")}
+                    if ov.get("pay_to") in role_map:
+                        code, rkey = role_map[ov["pay_to"]]
+                        target = hierarchy.get(rkey, (None, None))[0]
+                        tvid = lookups.vendor_id_by_name.get(target) if target else None
+                        if tvid is not None:
+                            ctype, vendor_id = code, tvid
+                        else:
+                            reason = ("override points to deal "
+                                      f"{ov['pay_to']} but none is on file")
+                    elif ov.get("pay_to") == "self":
+                        ctype = int(ov.get("code", 0)) or None
+                elif ov is not None:  # legacy integer = keep broker, that code
+                    ctype = int(ov)
+            if reason is None:
+                reason = None if ctype else "broker not found in deal hierarchy"
         else:
             reason = f"unknown comm type: {src_type}"
 
@@ -260,6 +279,18 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
             out_rows.append(row)
 
     output = pd.DataFrame(out_rows, columns=C.OUTPUT_COLUMNS)
+    if exclude_nonpositive_vendors and len(output):
+        vt = output.groupby("Vendor")[" Comm Amt "].transform("sum")
+        bad = vt <= 0
+        if bad.any():
+            moved = output[bad]
+            for _, mr in moved.iterrows():
+                exc_rows.append({**mr.to_dict(),
+                                 "Source Broker Name": None,
+                                 "Exception Reason":
+                                 "vendor total zero/negative - NetSuite "
+                                 "cannot post this bill"})
+            output = output[~bad].reset_index(drop=True)
     for col in ("Invoice Amt", "Commissionable", " Comm Amt ", "PEPM"):
         output[col] = pd.to_numeric(output[col], errors="coerce").round(2)
     exceptions = pd.DataFrame(exc_rows)
