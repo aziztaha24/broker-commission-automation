@@ -12,6 +12,15 @@ Every rule here was verified against the June 2026 files:
 from __future__ import annotations
 import re
 import datetime as dt
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def money2(v):
+    """Round to cents the way NetSuite does: half-up (127.485 -> 127.49),
+    not banker's rounding (which gives 127.48)."""
+    if v is None or pd.isna(v):
+        return None
+    return float(Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -292,16 +301,16 @@ def run_transform(source: pd.DataFrame, onhold_groups: set[str],
                                  "cannot post this bill"})
             output = output[~bad].reset_index(drop=True)
     for col in ("Invoice Amt", "Commissionable", " Comm Amt ", "PEPM"):
-        output[col] = pd.to_numeric(output[col], errors="coerce").round(2)
+        output[col] = pd.to_numeric(output[col], errors="coerce").map(money2)
     exceptions = pd.DataFrame(exc_rows)
     if len(exceptions):
         for col in ("Invoice Amt", "Commissionable", " Comm Amt ", "PEPM"):
             if col in exceptions.columns:
                 exceptions[col] = pd.to_numeric(exceptions[col],
-                                                errors="coerce").round(2)
-    # identical rounding basis to the output columns (pandas half-even)
-    src_total = round(float(pd.Series([clean_money(x) for x in df["Comm Amt"]],
-                                      dtype="float64").round(2).sum()), 2)
+                                                errors="coerce").map(money2)
+    # identical rounding basis to the output columns (half-up, like NetSuite)
+    src_total = round(sum(money2(v) or 0.0
+                          for v in (clean_money(x) for x in df["Comm Amt"])), 2)
     out_total = round(output[" Comm Amt "].sum(), 2) if len(output) else 0.0
     exc_total = (round(pd.to_numeric(exceptions[" Comm Amt "],
                   errors="coerce").fillna(0).sum(), 2) if len(exc_rows) else 0.0)
